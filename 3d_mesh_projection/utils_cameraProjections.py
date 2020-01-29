@@ -1,6 +1,6 @@
 import numpy as np
-from mpl_toolkits import mplot3d
-import matplotlib.pyplot as plt 
+# from mpl_toolkits import mplot3d
+# import matplotlib.pyplot as plt 
 import cv2 
 import math
 
@@ -44,7 +44,16 @@ class MeshToIMGProjector():
 		homoCoord[:, :-1] = pts             
 		return homoCoord
 
-	def projection(self, pts, camera='ortho'):
+	# def checkVisiblePtsInImg(self, pts):
+	# 	''' check Pts are in the Image area or Not'''
+	# 	num_pts = pts.shape[0]
+	# 	flags = np.full((num_pts, ), True, dtype=bool)
+	# 	flags = np.logical_and(flags, abs(pts[:, 0]) <= self.image_W/2.0)
+	# 	flags = np.logical_and(flags, abs(pts[:, 1]) <= self.image_H/2.0)
+
+	# 	return flags
+
+	def projectPtsToCameraPlane(self, pts, camera='ortho'):
 		if pts.shape[1] == 3:
 			pts = self.getHomogeneousCoordinates(pts)
 		pts = np.transpose(pts) # (4, N)
@@ -68,28 +77,26 @@ class MeshToIMGProjector():
 
 		return projPts[:, :2]
 
-	def checkVisiblePtsInImg(self, pts):
-		''' check Pts are in the Image area or Not'''
-		num_pts = pts.shape[0]
-		flags = np.full((num_pts, ), True, dtype=bool)
-		flags = np.logical_and(flags, abs(pts[:, 0]) <= self.image_W/2.0)
-		flags = np.logical_and(flags, abs(pts[:, 1]) <= self.image_H/2.0)
-
-		return flags
-
-	def projectToPixelsCoord(self, pts, tris, camera='ortho'):
+	def projectPtsToPixels(self, pts, tris, camera='ortho', pt_values=None):
 		''' from world Cooordinates (x, y, z) to Pixel Coordinates (h, w) 
 			Pixels' coordinates refer to is located in the upper-left corner of the image.
 			Pixel scale, 1 pixel = scale_factor *1 mm , default=1
 		'''
-		num_pts = pts.shape[0]
-
-		# projection:  orthogonal, weak-perspective, perspective
-		projPts = self.projection(pts, camera=camera)
-		insidePixels, insideBarrys, _, _, _ =  self.rasterization(projPts, tris)
-		projPts = np.concatenate((projPts, insidePixels), axis=0)
+		# 0) projection:  orthogonal, weak-perspective, perspective
+		depth = np.reshape(pts[:, 2], (-1, 1)) # z-value
+		projPts = self.projectPtsToCameraPlane(pts, camera=camera)
+		# Rasterization, to fill the triangles
+		insidePts, _, insidePvs, insidePds = self.rasterization(projPts, tris, pt_values=pt_values, depth_values=depth)
+		projPts = np.concatenate((projPts, insidePts), axis=0)
+		if insidePvs is not None:
+			pt_values = np.concatenate((pt_values, insidePvs), axis=0)
+		if insidePds is not None:
+			depth = np.concatenate((depth, insidePds), axis=0)
 		# From Screen Space to Raster Space, Pixel's coordinates are intergers
+		# For each point/vert, corresponding to a pixel
 		# 1) Re-map P's coordinates in the range [0, 1], Normalized Device Coordinate
+		num_pts = projPts.shape[0]
+
 		P_normalized = np.zeros((num_pts, 2), dtype=np.float32)
 		P_normalized[:, 0] = (projPts[:, 0] + self.image_W / 2.0) / self.image_W # Width
 		P_normalized[:, 1] = (projPts[:, 1] + self.image_H / 2.0) / self.image_H # Height
@@ -97,10 +104,12 @@ class MeshToIMGProjector():
 		P_raster = np.zeros((num_pts, 2), dtype=np.int32)
 		P_raster[:, 0] = np.int32(np.floor(P_normalized[:, 0] * self.image_W)) # width
 		P_raster[:, 1] = np.int32(np.floor(P_normalized[:, 1] * self.image_H)) # height
+		# 
+		img = self.projectPixelCoordsToImg(P_raster, pixel_values=pt_values, depth_values=depth)
 
-		return P_raster
+		return img
 
-	def projectPixelCoordsToImg(self, pixel_coords, pixel_values, depth_values):
+	def projectPixelCoordsToImg(self, pixel_coords, pixel_values=None, depth_values=None):
 		num_pts = pixel_coords.shape[0]
 		image = np.zeros((self.image_H, self.image_W), dtype=np.float32)
 		depth = np.ones((self.image_H, self.image_W), dtype=np.float32) * 1e4
@@ -147,38 +156,43 @@ class MeshToIMGProjector():
 
 	def getPixelsInTriangle(self, pt0, pt1, pt2):
 		'''
-		 solved by Edge function, 
-		 	E01(P) = (P.x - pt0.x) * (pt1.y - pt0.y) - (P.y - pt0.y) * (pt1.x - pt0.x)
-		 	E12(P) = (P.x - pt1.x) * (pt2.y - pt1.y) - (P.y - pt1.y) * (pt2.x - pt1.x)
-		 	E20(P) = (P.x - pt2.x) * (pt0.y - pt2.y) - (P.y - pt2.y) * (pt0.x - pt2.x)
-			if all E(P)s are positive (clock-wise). then P lies inside the triangles
+		 solved by Edge function, or Barrycentric Cooordinates
 		'''
 		pixels = np.empty((0, 2), dtype=np.int32)
 		barrys = np.empty((0, 3), dtype=np.float32)
 
 		# find the Bound Box
-		xmin = np.rint(min(pt0[0], pt1[0], pt2[0]))
-		xmax = np.rint(max(pt0[0], pt1[0], pt2[0]))
-		ymin = np.rint(min(pt0[1], pt1[1], pt2[1]))
-		ymax = np.rint(max(pt0[1], pt1[1], pt2[1]))
+		xmin = np.int32(np.floor(min(pt0[0], pt1[0], pt2[0])))
+		xmax = np.int32(np.floor(max(pt0[0], pt1[0], pt2[0])))
+		ymin = np.int32(np.floor(min(pt0[1], pt1[1], pt2[1])))
+		ymax = np.int32(np.floor(max(pt0[1], pt1[1], pt2[1])))
 		# loop to check if pixel lies inside of the triangle
 		for px in range(xmin, xmax):
 			for py in range(ymin, ymax):
-				# Edge Function
-				E01 = (px - pt0[0])*(pt1[1] - pt0[1]) - (py - pt0[1])*(pt1[0] - pt0[0])
-				E12 = (px - pt1[0])*(pt2[1] - pt1[1]) - (py - pt1[1])*(pt2[0] - pt1[0])
-				E20 = (px - pt2[0])*(pt0[1] - pt2[1]) - (py - pt2[1])*(pt0[0] - pt2[0])
-				# if all edge functions return positive or equal to 0
-				if E01 >=0 and E12 >= 0 and E20 >=0:
-					P = np.array([[px, py]])
+				P = np.array([[px, py]]) 
+				flag, bc = self.getBarrycentricCoords(P, pt0, pt1, pt2)
+				if flag:
 					pixels = np.concatenate((pixels, P), axis=0)
-					# get barraycentric coords
-					bc = self.getBarrycentricCoords(P, pt0, pt1, pt2)
 					barrys = np.concatenate((barrys, bc), axis=0)
 
 		return pixels, barrys
 
-	def getBarrycentricCoords(self, p, pt0, pt1, pt2):
+	def edgeFunction(self, P, pt0, pt1, pt2):
+		'''
+		    Pts in clock-wise order
+
+			E01(P) = (P.x - pt0.x) * (pt1.y - pt0.y) - (P.y - pt0.y) * (pt1.x - pt0.x)
+		 	E12(P) = (P.x - pt1.x) * (pt2.y - pt1.y) - (P.y - pt1.y) * (pt2.x - pt1.x)
+		 	E20(P) = (P.x - pt2.x) * (pt0.y - pt2.y) - (P.y - pt2.y) * (pt0.x - pt2.x)
+			if all E(P)s are positive (clock-wise). then P lies inside the triangles
+		'''
+		E01 = (P[0] - pt0[0])*(pt1[1] - pt0[1]) - (P[1] - pt0[1])*(pt1[0] - pt0[0])
+		E12 = (P[0] - pt1[0])*(pt2[1] - pt1[1]) - (P[1] - pt1[1])*(pt2[0] - pt1[0])
+		E20 = (P[0] - pt2[0])*(pt0[1] - pt2[1]) - (P[1] - pt2[1])*(pt0[0] - pt2[0])
+		flag = E01 >=0 and E12 >= 0 and E20 >=0
+		return flag
+
+	def getBarrycentricCoords(self, P, pt0, pt1, pt2):
 		''' 
 		 Barrycentric Coordinates
 			P = lambda0 * V0 + lambda1 * V1 + lambda2 * V2
@@ -188,63 +202,80 @@ class MeshToIMGProjector():
 			
 			tri_area = area_BCP + area_ACP + area_ABP
 		'''
+
+		flag, v , u, w = False, 1, 0, 0
+
 		tri_area = np.linalg.norm(np.cross((pt1 - pt0), (pt2 - pt0))) 
-		if tri_area == 0: # it is not a triable but a point
-			v , u, w = 1, 0, 0
-		else:
+		if tri_area > 0: # it is a triable but not a point
 			# triangle BCP corresponds to pt0
-			tri_BCP = np.linalg.norm(np.cross((p - pt2), (pt1 - pt2))) 
+			tri_BCP = np.linalg.norm(np.cross((P - pt2), (pt1 - pt2))) 
 			v = tri_BCP / tri_area
 			# triangle ACP corresponds to pt1
-			tri_ACP = np.linalg.norm(np.cross((pt2 - pt0), (p - pt0))) 
+			tri_ACP = np.linalg.norm(np.cross((pt2 - pt0), (P - pt0))) 
 			w = tri_ACP / tri_area 
 			# triangle ABP corresponds to pt2
-			u = 1 - v - w
-		return np.array([[v, w, u]])
+			tri_ABP = np.linalg.norm((np.cross((P - pt0), (pt1 - pt0))))
+			u = tri_ABP / tri_area # u = 1 - v - w
 
-	def rasterization(self, pixel_coords, tris, rgb_values=None, depth_values=None, uv_values=None):
+			flag =  (tri_ABP + tri_ACP + tri_BCP) == tri_area
+
+		return flag, np.array([[v, w, u]])
+
+	def rasterization(self, pts, tris, pt_values=None, depth_values=None):
 		'''
 		Rasterization is the process of determining which pixels are inside a triangle
+		
+		inputs: 2D points
+		Solved by Barrycentric Coordinates
 		'''
-		insidePixels = np.empty(shape=(0, 2), dtype=np.int32)
-		insideBarrys = np.empty(shape=(0, 3), dtype=np.float32)
 
-		RGB   = np.empty(shape=(0, 3), dtype=np.float32)
-		UV    = np.empty(shape=(0, 2), dtype=np.float32)
-		DEPTH = np.empty(shape=(0, 1), dtype=np.float32)
+		insidePts = np.empty(shape=(0, 2), dtype=np.int32)
+		insideBcs = np.empty(shape=(0, 3), dtype=np.float32)
+
+		if pt_values is not None:
+			insidePvs = np.empty(shape=(0, pt_values.shape[1]), dtype=np.float32)
+		else:
+			insidePvs = None
+
+		if depth_values is not None:
+			insidePds = np.empty(shape=(0, depth_values.shape[1]), dtype=np.float32)
+		else:
+			insidePds = None
 
 		for ii in range(tris.shape[0]):
 			vIdx = tris[ii, :]   
-			V0 = pixel_coords[vIdx[0], :] 
-			V1 = pixel_coords[vIdx[1], :]
-			V2 = pixel_coords[vIdx[2], :]
+			V0 = pts[vIdx[0], :] 
+			V1 = pts[vIdx[1], :]
+			V2 = pts[vIdx[2], :]
 			# sort points in clock-wise
 			V0, V1, V2, vIdx = self.sortPtsInClockWise(V0, V1, V2, vIdx)
 			# get pixels inside the triangles and their barrycentric coordinates
-			pixels, bcCoords = self.getPixelsInTriangle(V0, V1, V2)
-			insidePixels = np.concatenate((insidePixels, pixels), axis=0)
-			insideBarrys = np.concatenate((insideBarrys, bcCoords), axis=0)
+			inPts, inBcs = self.getPixelsInTriangle(V0, V1, V2)
+			insidePts = np.concatenate((insidePts, inPts), axis=0)
+			insideBcs = np.concatenate((insideBcs, inBcs), axis=0)
 
-			# calculate the rgb values, depth values
-			if rgb_values is not None:
-				pixel_rgb = rgb_values[vIdx, :] # (3,3)
-				for bc in bcCoords:
-					pt_rgb = np.matmul(bc, pixel_rgb)
-					RGB = np.concatenate((RGB, pt_rgb), axis=0)
+			# calculate the rgb, depth , or uv values
+			if pt_values is not None:
+				pv = np.zeros((3, pt_values.shape[1]), dtype=np.float32)
+				pv[0, :] = pt_values[vIdx[0], :]
+				pv[1, :] = pt_values[vIdx[1], :]
+				pv[2, :] = pt_values[vIdx[2], :]
+				for bc in inBcs:
+					bc = np.reshape(bc, (-1,3))
+					pt_value = np.matmul(bc, pv)
+					insidePvs = np.concatenate((insidePvs, pt_value), axis=0)
 
 			if depth_values is not None:
-				pixel_depth = depth_values[vIdx, :]
-				for bc in bcCoords:
-					pt_depth = np.matmul(bc, pixel_depth)
-					DEPTH = np.concatenate(DEPTH, pt_depth, axis=0)
+				pd = np.zeros((3, depth_values.shape[1]), dtype=np.float32)
+				pd[0, :] = depth_values[vIdx[0], :]
+				pd[1, :] = depth_values[vIdx[1], :]
+				pd[2, :] = depth_values[vIdx[2], :]
+				for bc in inBcs:
+					bc = np.reshape(bc, (-1,3))
+					pd_value = np.matmul(bc, pd)
+					insidePds = np.concatenate((insidePds, pd_value), axis=0)
 
-			if uv_values is not None:
-				pixel_uv = vu_values[vIdx, :]
-				for bc in bcCoords:
-					pt_uv = np.matmul(bc, pixel_uv)
-					UV = np.concatenate((UV, pt_uv), axis=0)
-
-		return insidePixels, insideBarrys, RGB, DEPTH, UV
+		return insidePts, insideBcs, insidePvs, insidePds
 
 if __name__ == '__main__':
 
@@ -255,24 +286,12 @@ if __name__ == '__main__':
 	pts[:, 2] = -pts[:, 2] # x = -x , z = -z, rotate 180 degree around Y-axis
 	pts[:, 2] = pts[:, 2] + object_dist # Assume the camera at the origin
 
-	projector = MeshToIMGProjector(image_size=(224, 224), focal_len=35, camera_dist=object_dist)
-	pixel_coords = projector.projectToPixelsCoord(pts, tris, camera='ortho')
+	pt_values = np.ones((pts.shape[0], 1), dtype=np.float32) * 255
 
-	# insidePixels, insideBarrys, _, _, _ =  projector.rasterization(pixel_coords, tris)
+	projector = MeshToIMGProjector(image_size=(448, 448), focal_len=35, camera_dist=object_dist)
+	img = projector.projectPtsToPixels(pts, tris, camera='weakPerspective', pt_values=pt_values)
 
-	# pixel_coords = np.concatenate((pixel_coords, insidePixels), axis=0)
-
-	depth_values = np.ones((pixel_coords.shape[0],), dtype=np.float32)*255
-	pixel_values = np.ones((pixel_coords.shape[0],), dtype=np.float32)*255
-
-	mask  = projector.projectPixelCoordsToImg(pixel_coords, pixel_values, depth_values)
-	# u_map = projector.projectPixelCoordsToImg(pixel_coords, vt[:, 0], depth_values) 
-	# v_map = projector.projectPixelCoordsToImg(pixel_coords, vt[:, 1], depth_values)
-	# d_map = projector.projectPixelCoordsToImg(pixel_coords, depth_values, depth_values)
-	
-	# visible_idx = projector.checkVisibleByDepth(pixel_coords, depth_values)
-
-	cv2.imwrite('mask.png', mask)
+	cv2.imwrite('mask.png', img)
 	# cv2.imwrite('u_map.png', np.uint8(u_map*255))
 	# cv2.imwrite('v_map.png', np.uint8(v_map*255))
 	# cv2.imwrite('d_map.png', d_map)
