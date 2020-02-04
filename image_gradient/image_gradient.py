@@ -43,25 +43,65 @@ def sobel_fromCV(img):
 
 	return mag
 
+# def getContour(img):
+# 	s = np.linspace(0, 2*np.pi, 400)
+# 	r = 100 + 100*np.sin(s)
+# 	c = 220 + 100*np.cos(s)
+# 	init = np.array([r, c]).T
 
+# 	snake = active_contour(gaussian(img, 3), 
+# 						   init, 
+# 						   alpha=0.015, 
+# 						   beta=10, 
+# 						   gamma=0.001, 
+# 						   coordinates='rc')
+# 	return snake
+
+def getContourPts(img):
+	H, W = img.shape
+
+	pts = []
+	for jj in range(H):
+		for ii in range(W):
+			if img[jj, ii] > 0:
+				pts.append([ii, jj])
+	pts = np.array(pts)
+	return pts
 
 if __name__ == '__main__':
 	
 	I = imageio.imread('male_0000.png')
-	print(I.shape)
 
-	I_gradient = sobel(I)
+	# I_gradient = sobel(I)
 	I_gradient02 = sobel_fromCV(I)
+	pts = getContourPts(I_gradient02)
+	print(pts.shape)
+
+	# fig, ax = plt.subplots()
+	# ax.imshow(I)
+	# ax.plot(pts[:, 0], pts[:, 1], 'k.', lw=0.1)
+	# ax.set_xlim([0, 200])
+	# ax.set_ylim([480, 0])
+	# plt.show()
 
 	fig = plt.figure()
 	ax01 = fig.add_subplot(131)
 	ax01.imshow(I)
 
+	ax01.set_ylim([480, 0])
+	ax01.set_xlim([0, 200])
+	ax01.plot(pts[:, 0], pts[:, 1], 'k.', lw=0.1)
+
 	ax02 = fig.add_subplot(132)
-	ax02.imshow(I_gradient)
+	# ax02.imshow(I_gradient)
+	ax02.plot(pts[:, 0], pts[:, 1], 'b.', lw=0.1)
+	ax02.set_ylim([480, 0])
+	ax02.set_xlim([0, 200])
 
 	ax03 = fig.add_subplot(133)
 	ax03.imshow(I_gradient02)
+	ax03.set_ylim([480, 0])
+	ax03.set_xlim([0, 200])
 
 	plt.show()
 
