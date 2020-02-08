@@ -53,6 +53,49 @@ class MeshToIMGProjector():
 
 	# 	return flags
 
+	def getMask(self, pts, tris, camera='weakPerspective', pt_values=None):
+		depth = np.reshape(pts[:, 2], (-1, 1)) # z-value
+		if pts.shape[1] == 3:
+			pts = self.getHomogeneousCoordinates(pts)
+		pts = np.transpose(pts) # (4, N)
+
+		# projMatrix = np.zeros((3,4), dtype=np.float32)
+		# projMatrix[0, 0] = 1.0
+		# projMatrix[1, 1] = 1.0
+
+		if camera == 'weakPerspective':
+			z_avg = np.mean(pts, 1)[2]
+			scale_factor = -z_avg/self.focal_len
+		else:
+			scale_factor = -self.camera_dist / self.focal_len # orthogonal
+
+		# projPts = np.matmul(projMatrix, pts)
+		# projPts = np.transpose(projPts)
+		projPts = np.transpose(pts)
+		projPts = projPts[:, :2] 
+
+		# fill the triangles before scaling
+		insidePts, insideBcs = self.rasterization02(projPts, tris)
+		projPts = np.concatenate((projPts, insidePts), axis=0)
+
+		# scaling
+		projPts = projPts / scale_factor
+
+		# 1) Re-map P's coordinates in the range [0, 1], Normalized Device Coordinate
+		num_pts = projPts.shape[0]
+
+		P_normalized = np.zeros((num_pts, 2), dtype=np.float32)
+		P_normalized[:, 0] = (projPts[:, 0] + self.image_W / 2.0) / self.image_W # Width
+		P_normalized[:, 1] = (projPts[:, 1] + self.image_H / 2.0) / self.image_H # Height
+		# 2) define the pixel coordinate in raster space
+		P_raster = np.zeros((num_pts, 2), dtype=np.int32)
+		P_raster[:, 0] = np.int32(np.floor(P_normalized[:, 0] * self.image_W)) # width
+		P_raster[:, 1] = np.int32(np.floor(P_normalized[:, 1] * self.image_H)) # height
+		# 
+		img = self.projectPixelCoordsToImg02(P_raster)
+
+		return img
+
 	def projectPtsToCameraPlane(self, pts, camera='ortho'):
 		if pts.shape[1] == 3:
 			pts = self.getHomogeneousCoordinates(pts)
@@ -85,6 +128,11 @@ class MeshToIMGProjector():
 		# 0) projection:  orthogonal, weak-perspective, perspective
 		depth = np.reshape(pts[:, 2], (-1, 1)) # z-value
 		projPts = self.projectPtsToCameraPlane(pts, camera=camera)
+
+		# plt.figure()
+		# plt.plot(projPts[:, 0], projPts[:, 1], 'b.')
+		# plt.show()
+
 		# Rasterization, to fill the triangles
 		insidePts, _, insidePvs, insidePds = self.rasterization(projPts, tris, pt_values=pt_values, depth_values=depth)
 		projPts = np.concatenate((projPts, insidePts), axis=0)
@@ -123,6 +171,19 @@ class MeshToIMGProjector():
 				if d_value < depth[y, x]:
 					depth[y, x] = d_value
 					image[y, x] = pixel_values[pt_idx] 
+		return image
+
+	def projectPixelCoordsToImg02(self, pixel_coords):
+		num_pts = pixel_coords.shape[0]
+		image = np.zeros((self.image_H, self.image_W), dtype=np.float32)
+		depth = np.ones((self.image_H, self.image_W), dtype=np.float32) * 1e4
+
+		for pt_idx in range(num_pts):
+			# Check visible parts, if projPt lies outside of the image, ignore it
+			x, y = pixel_coords[pt_idx, 0], pixel_coords[pt_idx, 1]
+			if x>=0 and x < self.image_W and y >=0 and y < self.image_H:
+				image[y, x] = 1
+
 		return image
 
 	def checkVisibleByDepth(self, pixel_coords, depth_values):
@@ -277,6 +338,32 @@ class MeshToIMGProjector():
 
 		return insidePts, insideBcs, insidePvs, insidePds
 
+	def rasterization02(self, pts, tris):
+		'''
+		Rasterization is the process of determining which pixels are inside a triangle
+		
+		inputs: 2D points
+		Solved by Barrycentric Coordinates
+		'''
+
+		insidePts = np.empty(shape=(0, 2), dtype=np.int32)
+		insideBcs = np.empty(shape=(0, 3), dtype=np.float32)
+
+		for ii in range(tris.shape[0]):
+			vIdx = tris[ii, :]   
+			V0 = pts[vIdx[0], :] 
+			V1 = pts[vIdx[1], :]
+			V2 = pts[vIdx[2], :]
+			# sort points in clock-wise
+			V0, V1, V2, vIdx = self.sortPtsInClockWise(V0, V1, V2, vIdx)
+			# get pixels inside the triangles and their barrycentric coordinates
+			inPts, inBcs = self.getPixelsInTriangle(V0, V1, V2)
+			insidePts = np.concatenate((insidePts, inPts), axis=0)
+			insideBcs = np.concatenate((insideBcs, inBcs), axis=0)
+
+		return insidePts, insideBcs
+
+
 if __name__ == '__main__':
 
 	object_dist = 350 # mm, the distance from camera to the object
@@ -289,7 +376,9 @@ if __name__ == '__main__':
 	pt_values = np.ones((pts.shape[0], 1), dtype=np.float32) * 255
 
 	projector = MeshToIMGProjector(image_size=(448, 448), focal_len=35, camera_dist=object_dist)
-	img = projector.projectPtsToPixels(pts, tris, camera='weakPerspective', pt_values=pt_values)
+	# img = projector.projectPtsToPixels(pts, tris, camera='weakPerspective', pt_values=pt_values)
+
+	img = projector.getMask(pts, tris, camera='weakPerspective', pt_values=pt_values)
 
 	cv2.imwrite('mask.png', img)
 	# cv2.imwrite('u_map.png', np.uint8(u_map*255))
